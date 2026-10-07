@@ -20,24 +20,27 @@ A la fin de la reunion (Ctrl+C), il produit un compte-rendu complet au format Ma
 | OS | Linux avec PipeWire ou PulseAudio |
 | GPU | NVIDIA avec CUDA (RTX 3060 6GB minimum recommande) |
 | Python | 3.12+ (avec `python3-venv`) |
-| FFmpeg | Installe et dans le PATH |
-| Ollama | Installe et en cours d'execution |
-| pactl | Disponible (paquet `pulseaudio-utils` ou inclus avec PipeWire) |
+| FFmpeg | Installe par `setup.sh` |
+| Ollama | Installe par `setup.sh` (le serveur doit tourner) |
+| pactl | Installe par `setup.sh` (paquet `pulseaudio-utils`) |
 
 ## Installation
 
 ```bash
-# 1. Installer le venv et les dependances Python (PyTorch + requirements.txt)
 cd option_a_local
 chmod +x setup.sh
-./setup.sh
-
-# 2. Installer Ollama (si pas deja fait)
-curl -fsSL https://ollama.com/install.sh | sh
-
-# 3. Telecharger le modele Mistral
-ollama pull mistral
+./setup.sh              # installation standard (modes off / simple)
+./setup.sh --advanced   # + PyTorch CUDA 12.8 et pyannote.audio (mode advanced)
 ```
+
+`setup.sh` s'occupe de tout (Debian/Ubuntu, `sudo` est demande si necessaire) :
+
+1. **Paquets systeme** : installe ceux qui manquent parmi `ffmpeg`, `pulseaudio-utils` (`pactl`), `curl`, `python3-venv`
+2. **Ollama** : l'installe via le script officiel s'il est absent, attend que le serveur reponde, puis telecharge le modele (`mistral` par defaut ; autre modele avec `OLLAMA_MODEL=llama3 ./setup.sh`)
+3. **Python** : cree `.venv` et installe `requirements.txt`, y compris les librairies CUDA pour Whisper (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`)
+4. **`--advanced` uniquement** : installe `torch` + `torchaudio` (index CUDA 12.8, ~3 Go) et `pyannote.audio`
+
+Le script est idempotent : les composants deja installes sont ignores.
 
 ## Utilisation
 
@@ -107,11 +110,11 @@ python meeting.py --diarization advanced
    - https://huggingface.co/pyannote/speaker-diarization-3.1 → cliquer "Agree and access repository"
    - https://huggingface.co/pyannote/segmentation-3.0 → cliquer "Agree and access repository"
    - https://huggingface.co/pyannote/speaker-diarization-community-1 → cliquer "Agree and access repository"
-3. **Installer la dependance** :
+3. **Installer les dependances** :
    ```bash
-   pip install pyannote.audio
+   ./setup.sh --advanced
    ```
-   Cela installe aussi `torch` et `torchaudio` (~2 Go). Si PyTorch avec CUDA est deja dans le venv, il sera reutilise.
+   Cela installe `torch` et `torchaudio` (CUDA 12.8, ~3 Go) et `pyannote.audio`.
 4. **Definir le token** via un fichier `.env` (recommande) ou en variable d'environnement :
    ```bash
    # Option 1 : fichier .env (recommande — charge automatiquement)
@@ -196,6 +199,61 @@ L'affichage utilise Rich et se compose de quatre zones.
 - **Panneau Analyse IA** (bleu) : le contenu de la derniere analyse intermediaire ou finale
 - **Panneau Suggestions** (magenta) : suggestions actionnables en temps reel — questions a poser, points a clarifier, alertes de consensus, rappels d'actions
 - **Barre de statut** : duree ecoulee, nombre de chunks traites, compte a rebours avant la prochaine analyse
+
+---
+
+## Depannage
+
+### Apres un deplacement du dossier du projet
+
+Le virtual environment Python (`.venv`) contient des chemins absolus et **casse si le dossier est deplace**. Il faut le recreer :
+
+```bash
+python3 -m venv .venv --clear
+./setup.sh              # ou ./setup.sh --advanced
+```
+
+### Erreur `libcublas.so.12 is not found`
+
+Les paquets pip `nvidia-cublas-cu12` et `nvidia-cudnn-cu12` installent les libs dans `.venv/lib/.../nvidia/{cublas,cudnn}/lib/`, mais `ctranslate2` ne les trouve pas automatiquement. Le script les precharge au demarrage via `_preload_nvidia_libs()` (avant l'import de `faster_whisper`).
+
+Si l'erreur apparait, verifiez que ces paquets sont bien installes dans le venv :
+
+```bash
+.venv/bin/pip install -r requirements.txt
+```
+
+### Partage VRAM entre Whisper et Ollama (RTX 3060 6 Go)
+
+Whisper (`large-v3`) et Ollama/Mistral ne tiennent pas ensemble en VRAM sur une carte 6 Go. Si Ollama a deja charge un modele, Whisper ne pourra pas se charger sur le GPU et basculera en CPU (transcription ~3x plus lente).
+
+**Solution recommandee** : forcer Ollama en CPU pour laisser toute la VRAM a Whisper.
+
+```bash
+sudo systemctl edit ollama
+```
+
+Ajouter :
+
+```ini
+[Service]
+Environment="CUDA_VISIBLE_DEVICES="
+```
+
+Puis :
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+```
+
+L'analyse IA sera un peu plus lente sur CPU, mais la transcription restera rapide sur GPU. C'est le meilleur compromis car la transcription est en temps reel (latence critique) alors que l'analyse ne tourne que toutes les 2.5 minutes.
+
+Pour revenir en arriere (Ollama sur GPU) :
+
+```bash
+sudo systemctl revert ollama
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+```
 
 ---
 

@@ -17,6 +17,25 @@ from queue import Empty, Queue
 
 import numpy as np
 import ollama
+
+
+def _preload_nvidia_libs():
+    """Preload CUDA libs from pip wheels (nvidia-cublas-cu12, nvidia-cudnn-cu12)
+    so ctranslate2 finds them without LD_LIBRARY_PATH."""
+    import ctypes
+    import glob
+    import site
+    for sp in site.getsitepackages():
+        for pattern in ("nvidia/cublas/lib/libcublasLt.so.*", "nvidia/cublas/lib/libcublas.so.*",
+                        "nvidia/cudnn/lib/libcudnn*.so.*"):
+            for lib in sorted(glob.glob(os.path.join(sp, pattern))):
+                try:
+                    ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+
+
+_preload_nvidia_libs()
 from faster_whisper import WhisperModel
 from rich.console import Console
 from rich.layout import Layout
@@ -54,13 +73,7 @@ console = Console()
 # Whisper model pre-loading
 # ---------------------------------------------------------------------------
 def ensure_whisper_model() -> WhisperModel:
-    """Load Whisper model in the main thread with fallback chain.
-
-    1. WHISPER_MODEL on CUDA (int8_float16)
-    2. WHISPER_FALLBACK on CUDA (int8_float16)
-    3. WHISPER_FALLBACK on CPU (int8)
-    4. Exit with clear error
-    """
+    """Load Whisper model in the main thread with fallback chain."""
     attempts = [
         (WHISPER_MODEL, "cuda", WHISPER_COMPUTE),
         (WHISPER_FALLBACK, "cuda", WHISPER_COMPUTE),

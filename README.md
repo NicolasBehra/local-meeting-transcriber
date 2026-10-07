@@ -20,24 +20,27 @@ When you end the meeting (Ctrl+C), it produces a complete report in Markdown for
 | OS | Linux with PipeWire or PulseAudio |
 | GPU | NVIDIA with CUDA (RTX 3060 6GB minimum recommended) |
 | Python | 3.12+ (with `python3-venv`) |
-| FFmpeg | Installed and in PATH |
-| Ollama | Installed and running |
-| pactl | Available (`pulseaudio-utils` package or included with PipeWire) |
+| FFmpeg | Installed by `setup.sh` |
+| Ollama | Installed by `setup.sh` (server must be running) |
+| pactl | Installed by `setup.sh` (`pulseaudio-utils` package) |
 
 ## Installation
 
 ```bash
-# 1. Create the venv and install Python dependencies (PyTorch + requirements.txt)
 cd option_a_local
 chmod +x setup.sh
-./setup.sh
-
-# 2. Install Ollama (if not already done)
-curl -fsSL https://ollama.com/install.sh | sh
-
-# 3. Download the Mistral model
-ollama pull mistral
+./setup.sh              # standard install (off / simple modes)
+./setup.sh --advanced   # + PyTorch CUDA 12.8 and pyannote.audio (advanced mode)
 ```
+
+`setup.sh` takes care of everything (Debian/Ubuntu, `sudo` is requested if needed):
+
+1. **System packages**: installs the missing ones among `ffmpeg`, `pulseaudio-utils` (`pactl`), `curl`, `python3-venv`
+2. **Ollama**: installs it via the official script if absent, waits for the server, then downloads the model (`mistral` by default; override with `OLLAMA_MODEL=llama3 ./setup.sh`)
+3. **Python**: creates `.venv` and installs `requirements.txt`, including the CUDA libraries for Whisper (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`)
+4. **`--advanced` only**: installs `torch` + `torchaudio` (CUDA 12.8 index, ~3 GB) and `pyannote.audio`
+
+The script is idempotent: already-installed components are skipped.
 
 ## Usage
 
@@ -107,11 +110,11 @@ python meeting.py --diarization advanced
    - https://huggingface.co/pyannote/speaker-diarization-3.1 → click "Agree and access repository"
    - https://huggingface.co/pyannote/segmentation-3.0 → click "Agree and access repository"
    - https://huggingface.co/pyannote/speaker-diarization-community-1 → click "Agree and access repository"
-3. **Install the dependency**:
+3. **Install the dependencies**:
    ```bash
-   pip install pyannote.audio
+   ./setup.sh --advanced
    ```
-   This also installs `torch` and `torchaudio` (~2 GB). If PyTorch with CUDA is already in the venv, it will be reused.
+   This installs `torch` and `torchaudio` (CUDA 12.8, ~3 GB) and `pyannote.audio`.
 4. **Set the token** via a `.env` file (recommended) or environment variable:
    ```bash
    # Option 1: .env file (recommended — loaded automatically)
