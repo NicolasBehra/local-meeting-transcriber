@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Meeting recorder & analyzer — Option A (100% local: faster-whisper + Ollama/Mistral)."""
+"""Meeting recorder & analyzer — Option A (100% local: Parakeet/faster-whisper + Ollama)."""
 
 import argparse
 import os
@@ -20,13 +20,15 @@ import ollama
 
 
 def _preload_nvidia_libs():
-    """Preload CUDA libs from pip wheels (nvidia-cublas-cu12, nvidia-cudnn-cu12)
-    so ctranslate2 finds them without LD_LIBRARY_PATH."""
+    """Preload CUDA 12 libs from pip wheels (nvidia-*-cu12) so ctranslate2 and
+    onnxruntime-gpu find them without LD_LIBRARY_PATH."""
     import ctypes
     import glob
     import site
     for sp in site.getsitepackages():
-        for pattern in ("nvidia/cublas/lib/libcublasLt.so.*", "nvidia/cublas/lib/libcublas.so.*",
+        for pattern in ("nvidia/cuda_runtime/lib/libcudart.so.*",
+                        "nvidia/cublas/lib/libcublasLt.so.*", "nvidia/cublas/lib/libcublas.so.*",
+                        "nvidia/curand/lib/libcurand.so.*", "nvidia/cufft/lib/libcufft.so.*",
                         "nvidia/cudnn/lib/libcudnn*.so.*"):
             for lib in sorted(glob.glob(os.path.join(sp, pattern))):
                 try:
@@ -56,7 +58,12 @@ TRANSLATION_INTERVAL = 5  # seconds between translation batches
 WHISPER_MODEL = "large-v3"
 WHISPER_FALLBACK = "medium"
 WHISPER_COMPUTE = "int8_float16"
-OLLAMA_MODEL = "mistral"
+PARAKEET_MODEL = "nemo-parakeet-tdt-0.6b-v3"
+ASR_BACKENDS = ("parakeet", "whisper")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "ministral-3:3b")
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
+OLLAMA_KEEP_ALIVE = "30m"
+DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 LANGUAGE_DEFAULT = "fr"
 SUPPORTED_LANGUAGES = {
     "fr": "français",
@@ -70,7 +77,7 @@ console = Console()
 
 
 # ---------------------------------------------------------------------------
-# Whisper model pre-loading
+# ASR model pre-loading
 # ---------------------------------------------------------------------------
 def ensure_whisper_model() -> WhisperModel:
     """Load Whisper model in the main thread with fallback chain."""
@@ -95,6 +102,37 @@ def ensure_whisper_model() -> WhisperModel:
     sys.exit(1)
 
 
+def ensure_parakeet_model():
+    """Load Parakeet TDT v3 (onnx-asr) with Silero VAD, GPU first then CPU."""
+    import onnx_asr
+    # Grow the GPU memory arena only as needed (default doubles it) to leave VRAM for Ollama
+    cuda = ("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested",
+                                      "cudnn_conv_algo_search": "HEURISTIC"})
+    attempts = [
+        ("cuda", [cuda, "CPUExecutionProvider"]),
+        ("cpu", ["CPUExecutionProvider"]),
+    ]
+    last_error = None
+    for device, providers in attempts:
+        with console.status(f"Chargement du modele Parakeet '{PARAKEET_MODEL}' ({device})..."):
+            try:
+                model = onnx_asr.load_model(PARAKEET_MODEL, providers=providers)
+                vad = onnx_asr.load_vad("silero", providers=providers)
+                # onnxruntime silently falls back to CPU if CUDA libs fail to load
+                encoder = getattr(getattr(model, "asr", None), "_encoder", None)
+                if encoder is not None and "CUDAExecutionProvider" not in encoder.get_providers():
+                    device = "cpu"
+                console.print(f"[green]Parakeet '{PARAKEET_MODEL}' charge ({device}).[/green]")
+                return model.with_vad(vad, min_silence_duration_ms=500)
+            except Exception as e:
+                last_error = e
+                console.print(f"[yellow]Echec Parakeet ({device}): {e}[/yellow]")
+    console.print("[red bold]Impossible de charger Parakeet.[/red bold]")
+    console.print(f"[red]Derniere erreur: {last_error}[/red]")
+    console.print("[red]Essayez --asr whisper ou relancez ./setup.sh.[/red]")
+    sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Diarization pipeline pre-loading (advanced mode)
 # ---------------------------------------------------------------------------
@@ -110,14 +148,11 @@ def ensure_diarization_pipeline():
         from pyannote.audio import Pipeline
     except ImportError:
         console.print("[red]pyannote.audio non installe. Lancez:[/red]")
-        console.print("[red]  pip install pyannote.audio[/red]")
+        console.print("[red]  ./setup.sh --advanced[/red]")
         sys.exit(1)
-    with console.status("Chargement du modele pyannote speaker-diarization-3.1..."):
+    with console.status(f"Chargement du modele pyannote '{DIARIZATION_MODEL}'..."):
         try:
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                token=token,
-            )
+            pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, token=token)
             if torch.cuda.is_available():
                 pipeline.to(torch.device("cuda"))
             console.print("[green]Pyannote speaker-diarization charge.[/green]")
@@ -226,8 +261,8 @@ class AudioCapture(threading.Thread):
 class Transcriber(threading.Thread):
     def __init__(self, queue: Queue, transcript_log: list, lock: threading.Lock,
                  stop_event: threading.Event, chunks_counter: list,
-                 thread_errors: list, model: WhisperModel,
-                 language: str = "fr",
+                 thread_errors: list, model,
+                 language: str = "fr", asr_backend: str = "parakeet",
                  diarization: str = "off", diarization_pipeline=None):
         super().__init__(daemon=True)
         self.queue = queue
@@ -238,6 +273,7 @@ class Transcriber(threading.Thread):
         self.thread_errors = thread_errors
         self.model = model
         self.language = language
+        self.asr_backend = asr_backend
         self.diarization = diarization
         self.diarization_pipeline = diarization_pipeline
 
@@ -278,34 +314,37 @@ class Transcriber(threading.Thread):
         else:
             self._transcribe_standard(audio, source_label)
 
+    def _segments(self, audio: np.ndarray) -> list[dict]:
+        """Transcribe a chunk into [{"text", "start", "end"}] with the selected ASR backend."""
+        if self.asr_backend == "parakeet":
+            segments = self.model.recognize(audio, sample_rate=SAMPLE_RATE)
+        else:
+            segments, _ = self.model.transcribe(
+                audio, language=self.language, beam_size=5,
+                vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500),
+            )
+        result = []
+        for s in segments:
+            text = s.text.strip()
+            if text:
+                result.append({"text": text, "start": s.start, "end": s.end})
+        return result
+
     def _transcribe_standard(self, audio: np.ndarray, source_label: str):
-        segments, _ = self.model.transcribe(
-            audio, language=self.language, beam_size=5,
-            vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500),
-        )
+        segments = self._segments(audio)
         timestamp = datetime.now().strftime("%H:%M:%S")
         prefix = f"{source_label}: " if source_label else ""
         for seg in segments:
-            text = seg.text.strip()
-            if text:
-                entry = f"[{timestamp}] {prefix}{text}"
-                with self.lock:
-                    self.transcript_log.append(entry)
+            entry = f"[{timestamp}] {prefix}{seg['text']}"
+            with self.lock:
+                self.transcript_log.append(entry)
 
     def _transcribe_advanced(self, audio: np.ndarray):
         import torch
 
-        # Whisper transcription with timestamps
-        segments, _ = self.model.transcribe(
-            audio, language=self.language, beam_size=5,
-            vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500),
-        )
-        whisper_segments = []
-        for s in segments:
-            text = s.text.strip()
-            if text:
-                whisper_segments.append({"text": text, "start": s.start, "end": s.end})
-        if not whisper_segments:
+        # Transcription with timestamps
+        segments = self._segments(audio)
+        if not segments:
             return
 
         # Pyannote diarization
@@ -314,20 +353,22 @@ class Transcriber(threading.Thread):
             result = self.diarization_pipeline(
                 {"waveform": waveform, "sample_rate": SAMPLE_RATE}
             )
-            # pyannote 4.x returns DiarizeOutput, extract the Annotation
-            diarization = getattr(result, "speaker_diarization", result)
+            # pyannote 4.x returns DiarizeOutput: prefer the exclusive (non-overlapping)
+            # diarization, which aligns better with transcription segments
+            diarization = getattr(result, "exclusive_speaker_diarization", None) \
+                or getattr(result, "speaker_diarization", result)
         except Exception as e:
             # Diarization failed — fallback to transcription without speaker labels
             self.thread_errors.append(f"Pyannote error: {e}")
             timestamp = datetime.now().strftime("%H:%M:%S")
-            for seg in whisper_segments:
+            for seg in segments:
                 entry = f"[{timestamp}] {seg['text']}"
                 with self.lock:
                     self.transcript_log.append(entry)
             return
 
         timestamp = datetime.now().strftime("%H:%M:%S")
-        for seg in whisper_segments:
+        for seg in segments:
             speaker = self._find_speaker(diarization, seg["start"], seg["end"])
             entry = f"[{timestamp}] {speaker}: {seg['text']}"
             with self.lock:
@@ -346,7 +387,27 @@ class Transcriber(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# Analyzer thread (Ollama / Mistral)
+# Ollama helper
+# ---------------------------------------------------------------------------
+def llm_chat(prompt: str, temperature: float, thread_errors: list) -> str:
+    """Send a prompt to Ollama with an explicit context size (Ollama's default
+    truncates long transcripts silently) and keep the model loaded between calls."""
+    if len(prompt) > OLLAMA_NUM_CTX * 3:  # ~3 chars/token: prompt will be truncated
+        warning = (f"Prompt trop long pour num_ctx={OLLAMA_NUM_CTX}: debut de transcription "
+                   f"tronque par Ollama. Augmentez OLLAMA_NUM_CTX.")
+        if warning not in thread_errors:
+            thread_errors.append(warning)
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        options={"num_ctx": OLLAMA_NUM_CTX, "temperature": temperature},
+        keep_alive=OLLAMA_KEEP_ALIVE,
+    )
+    return response["message"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Analyzer thread (Ollama)
 # ---------------------------------------------------------------------------
 class Analyzer(threading.Thread):
     PROMPTS = {
@@ -468,22 +529,14 @@ class Analyzer(threading.Thread):
         kind = p["kind"][0] if is_final else p["kind"][1]
         prompt = p["analyze"].format(completeness=completeness, kind=kind, text=text)
         try:
-            response = ollama.chat(
-                model=OLLAMA_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response["message"]["content"]
+            return llm_chat(prompt, 0.2, self.thread_errors)
         except Exception as e:
             return f"[Erreur analyse: {e}]"
 
     def _suggest(self, text: str) -> str:
         prompt = self.prompts["suggest"].format(text=text)
         try:
-            response = ollama.chat(
-                model=OLLAMA_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response["message"]["content"]
+            return llm_chat(prompt, 0.5, self.thread_errors)
         except Exception as e:
             return f"[Erreur suggestions: {e}]"
 
@@ -524,7 +577,7 @@ class Analyzer(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# Translator thread (Ollama / Mistral)
+# Translator thread (Ollama)
 # ---------------------------------------------------------------------------
 class Translator(threading.Thread):
     def __init__(self, transcript_log: list, lock: threading.Lock,
@@ -550,11 +603,7 @@ class Translator(threading.Thread):
             f"Keep the timestamps in square brackets as-is.\n\n{text}"
         )
         try:
-            response = ollama.chat(
-                model=OLLAMA_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            result = response["message"]["content"].strip()
+            result = llm_chat(prompt, 0.2, self.thread_errors).strip()
             return result.split("\n")
         except Exception as e:
             return [f"[Erreur traduction: {e}]"]
@@ -737,6 +786,12 @@ def main():
              "advanced = pyannote IA (necessite HF_TOKEN)",
     )
     parser.add_argument(
+        "--asr", choices=ASR_BACKENDS, default="parakeet",
+        help="Moteur de transcription: "
+             "parakeet = NVIDIA Parakeet TDT 0.6B v3 (defaut, plus precis et rapide), "
+             "whisper = faster-whisper large-v3",
+    )
+    parser.add_argument(
         "--language", choices=SUPPORTED_LANGUAGES.keys(), default=LANGUAGE_DEFAULT,
         help=f"Langue de transcription (defaut: {LANGUAGE_DEFAULT}). "
              + ", ".join(f"{k}={v}" for k, v in SUPPORTED_LANGUAGES.items()),
@@ -755,7 +810,8 @@ def main():
         sys.exit(1)
 
     console.print("[bold cyan]Meeting Recorder — Option A (Local)[/bold cyan]")
-    console.print("[dim]Ollama + Mistral | faster-whisper GPU[/dim]")
+    asr_name = PARAKEET_MODEL if args.asr == "parakeet" else f"faster-whisper {WHISPER_MODEL}"
+    console.print(f"[dim]Transcription: {asr_name} | Analyse: Ollama {OLLAMA_MODEL}[/dim]")
     translate_info = f" | Traduction: {SUPPORTED_LANGUAGES[args.translate]}" if args.translate else ""
     console.print(f"[dim]Diarisation: {args.diarization} | Langue: {SUPPORTED_LANGUAGES[language]}{translate_info}[/dim]\n")
 
@@ -764,8 +820,8 @@ def main():
     console.print(f"[green]Micro:[/green] {mic}")
     console.print(f"[green]Monitor:[/green] {monitor}\n")
 
-    # Pre-load Whisper model in main thread
-    whisper_model = ensure_whisper_model()
+    # Pre-load ASR model in main thread
+    asr_model = ensure_parakeet_model() if args.asr == "parakeet" else ensure_whisper_model()
 
     # Pre-load diarization pipeline if advanced mode
     diarization_pipeline = None
@@ -795,8 +851,8 @@ def main():
 
     transcriber = Transcriber(
         audio_queue, transcript_log, lock, stop_event, chunks_counter,
-        thread_errors, whisper_model,
-        language=language,
+        thread_errors, asr_model,
+        language=language, asr_backend=args.asr,
         diarization=args.diarization, diarization_pipeline=diarization_pipeline,
     )
     analyzer = Analyzer(transcript_log, lock, analysis_log, suggestions_log, stop_event,

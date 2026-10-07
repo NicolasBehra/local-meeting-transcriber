@@ -1,7 +1,13 @@
 faster-whisper>=1.1.0
+onnx-asr[hub]>=0.12
+# onnxruntime-gpu >= 1.27 requires CUDA 13; stay on CUDA 12 like ctranslate2 (faster-whisper)
+onnxruntime-gpu>=1.24,<1.27
 numpy>=1.24
 rich>=13.0
 ollama>=0.4.0
 python-dotenv>=1.0
+nvidia-cuda-runtime-cu12
 nvidia-cublas-cu12
+nvidia-curand-cu12
+nvidia-cufft-cu12
 nvidia-cudnn-cu12==9.*

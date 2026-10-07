@@ -16,7 +16,7 @@ if [ ${#APT_PKGS[@]} -gt 0 ]; then
 fi
 
 # Ollama + modele
-OLLAMA_MODEL="${OLLAMA_MODEL:-mistral}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-ministral-3:3b}"
 if ! command -v ollama >/dev/null; then
     curl -fsSL https://ollama.com/install.sh | sh
 fi
@@ -36,9 +36,14 @@ python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
 pip install -r requirements.txt
+# faster-whisper depend de onnxruntime (CPU), qui ecrase les fichiers de onnxruntime-gpu
+if pip show onnxruntime >/dev/null 2>&1; then
+    pip uninstall -y onnxruntime
+    pip install --force-reinstall --no-deps "onnxruntime-gpu>=1.24,<1.27"
+fi
 if [ "$1" = "--advanced" ]; then
     pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
-    pip install pyannote.audio
+    pip install "pyannote.audio>=4.0"
 fi
 echo ""
 echo "Installation terminee. Pour lancer le script :"
